@@ -3,17 +3,20 @@ const cors    = require('cors');
 const crypto  = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const { Pool } = require('pg');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors({ origin:'*', methods:['GET','POST','PUT','DELETE','OPTIONS'], allowedHeaders:['Content-Type','Authorization'] }));
 app.options('*', cors());
 app.use(express.json());
 
+// ── POSTGRESQL ─────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes('railway.internal') ? false : { rejectUnauthorized: false }
 });
 
+// ── INIT TABLES ────────────────────────────────────────────────
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS agents (
@@ -55,23 +58,25 @@ async function initDB() {
       synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS orders (
-      id           TEXT PRIMARY KEY,
-      agent_id     TEXT NOT NULL REFERENCES agents(id),
-      market_id    TEXT NOT NULL REFERENCES markets(id),
-      outcome_id   TEXT NOT NULL REFERENCES outcomes(id),
-      side         TEXT NOT NULL,
-      amount_spent REAL NOT NULL,
-      shares       REAL NOT NULL,
-      avg_price    REAL NOT NULL,
-      fee          REAL NOT NULL DEFAULT 0,
-      status       TEXT NOT NULL DEFAULT 'filled',
-      pnl          REAL,
-      result       TEXT,
-      payout       REAL,
-      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      closed_at    TIMESTAMPTZ
+      id             TEXT PRIMARY KEY,
+      agent_id       TEXT NOT NULL REFERENCES agents(id),
+      market_id      TEXT NOT NULL REFERENCES markets(id),
+      outcome_id     TEXT NOT NULL REFERENCES outcomes(id),
+      side           TEXT NOT NULL,
+      amount_spent   REAL NOT NULL,
+      shares         REAL NOT NULL,
+      avg_price      REAL NOT NULL,
+      fee            REAL NOT NULL DEFAULT 0,
+      status         TEXT NOT NULL DEFAULT 'filled',
+      pnl            REAL,
+      result         TEXT,
+      payout         REAL,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      closed_at      TIMESTAMPTZ
     );
   `);
+
+  // Seed markets if empty
   const { rows } = await pool.query('SELECT COUNT(*) as c FROM markets');
   if (rows[0].c === '0') {
     const SEED = [
@@ -93,10 +98,11 @@ async function initDB() {
     ];
     for (const m of SEED) {
       await pool.query('INSERT INTO markets (id,title,category,closes_at,volume) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
-        [m.id,m.title,m.category,m.closes_at,Math.floor(Math.random()*50000000)+1000000]);
-      for (const o of m.outcomes)
+        [m.id, m.title, m.category, m.closes_at, Math.floor(Math.random()*50000000)+1000000]);
+      for (const o of m.outcomes) {
         await pool.query('INSERT INTO outcomes (id,market_id,label,price_yes,price_no) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
-          [o.id,m.id,o.label,o.py,+(1-o.py).toFixed(2)]);
+          [o.id, m.id, o.label, o.py, +(1-o.py).toFixed(2)]);
+      }
     }
     console.log('✅ Seeded markets');
   }
@@ -104,170 +110,298 @@ async function initDB() {
 }
 
 const apiKey = () => 'pm_live_' + crypto.randomBytes(20).toString('hex');
+
 const auth = async (req,res,next) => {
   const h = req.headers['authorization'];
   if (!h?.startsWith('Bearer ')) return res.status(401).json({error:{code:401,type:'UNAUTHORIZED',message:'Missing Authorization header.'}});
-  const {rows} = await pool.query('SELECT * FROM agents WHERE api_key=$1',[h.split(' ')[1]]);
+  const { rows } = await pool.query('SELECT * FROM agents WHERE api_key=$1', [h.split(' ')[1]]);
   if (!rows[0]) return res.status(401).json({error:{code:401,type:'UNAUTHORIZED',message:'Invalid API key.'}});
-  req.agent=rows[0]; next();
+  req.agent = rows[0]; next();
 };
 
 app.get('/', async (req,res) => {
-  const m=await pool.query('SELECT COUNT(*) as c FROM markets');
-  const a=await pool.query('SELECT COUNT(*) as c FROM agents');
+  const m = await pool.query('SELECT COUNT(*) as c FROM markets');
+  const a = await pool.query('SELECT COUNT(*) as c FROM agents');
   res.json({name:'PoneMarket API',version:'2.0.0',mode:'live',markets:+m.rows[0].c,agents:+a.rows[0].c});
 });
 
 app.post('/v1/agents/register', async (req,res) => {
-  const {name,provider,strategy,webhook_url}=req.body;
+  const {name,provider,strategy,webhook_url} = req.body;
   if (!name||!provider) return res.status(400).json({error:{code:400,type:'BAD_REQUEST',message:'name and provider required.'}});
-  if (!['anthropic','openai','google','custom'].includes(provider)) return res.status(400).json({error:{code:400,type:'INVALID_PROVIDER',message:'provider must be: anthropic, openai, google, or custom.'}});
-  const id=`agent_${uuidv4().split('-')[0]}`,key=apiKey();
-  await pool.query('INSERT INTO agents (id,name,api_key,provider,strategy,balance,webhook_url) VALUES ($1,$2,$3,$4,$5,0,$6)',[id,name,key,provider,strategy||'',webhook_url||null]);
-  res.status(201).json({agent_id:id,name,provider,api_key:key,balance_usdc:0,created_at:new Date().toISOString(),message:'Save your api_key — shown only once. Deposit USDC to start trading.'});
+  if (!['anthropic','openai','google','custom'].includes(provider))
+    return res.status(400).json({error:{code:400,type:'INVALID_PROVIDER',message:'provider must be: anthropic, openai, google, or custom.'}});
+  const id=`agent_${uuidv4().split('-')[0]}`, key=apiKey();
+  await pool.query('INSERT INTO agents (id,name,api_key,provider,strategy,balance,webhook_url) VALUES ($1,$2,$3,$4,$5,0,$6)',
+    [id,name,key,provider,strategy||'',webhook_url||null]);
+  res.status(201).json({agent_id:id,name,provider,api_key:key,balance_usdc:0,
+    created_at:new Date().toISOString(),message:'Save your api_key — shown only once. Deposit USDC to start trading.'});
 });
 
 app.get('/v1/agents/me', auth, async (req,res) => {
-  const a=req.agent;
-  const rank=await pool.query('SELECT COUNT(*)+1 as r FROM agents WHERE total_pnl > $1',[a.total_pnl]);
-  res.json({agent_id:a.id,name:a.name,provider:a.provider,strategy:a.strategy,status:a.status,balance_usdc:+a.balance.toFixed(2),total_pnl:+a.total_pnl.toFixed(2),total_trades:a.total_trades,win_rate:a.total_trades?+(a.wins/a.total_trades).toFixed(2):null,leaderboard_rank:+rank.rows[0].r});
+  const a = req.agent;
+  const rank = await pool.query('SELECT COUNT(*)+1 as r FROM agents WHERE total_pnl > $1',[a.total_pnl]);
+  res.json({agent_id:a.id,name:a.name,provider:a.provider,strategy:a.strategy,status:a.status,
+    balance_usdc:+a.balance.toFixed(2),total_pnl:+a.total_pnl.toFixed(2),total_trades:a.total_trades,
+    win_rate:a.total_trades?+(a.wins/a.total_trades).toFixed(2):null,leaderboard_rank:+rank.rows[0].r});
 });
 
 app.post('/v1/wallet/sync', auth, async (req,res) => {
-  const {amount,wallet,tx}=req.body;
+  const {amount,wallet,tx} = req.body;
   if (!amount||+amount<=0) return res.status(400).json({error:{code:400,type:'BAD_REQUEST',message:'amount required.'}});
+  // Prevent double-sync: check if this tx was already synced
   if (tx) {
-    const {rows:ex}=await pool.query('SELECT tx FROM synced_txs WHERE tx=$1',[tx]);
-    if (ex.length>0) {
-      const {rows:[a]}=await pool.query('SELECT balance FROM agents WHERE id=$1',[req.agent.id]);
+    const {rows:existing} = await pool.query('SELECT id FROM synced_txs WHERE tx=$1',[tx]);
+    if (existing.length>0) {
+      const {rows:[a]} = await pool.query('SELECT balance FROM agents WHERE id=$1',[req.agent.id]);
       return res.json({success:true,amount_added:0,new_balance:+a.balance.toFixed(2),tx,already_synced:true});
     }
     await pool.query('INSERT INTO synced_txs (tx,agent_id,amount) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING',[tx,req.agent.id,+amount]);
   }
-  const {rows}=await pool.query('UPDATE agents SET balance=$1,wallet=$2 WHERE id=$3 RETURNING balance',[+amount,wallet||null,req.agent.id]);
+  // Set balance to on-chain amount (not add) to prevent double-counting
+  const {rows} = await pool.query('UPDATE agents SET balance=$1,wallet=$2 WHERE id=$3 RETURNING balance',
+    [+amount,wallet||null,req.agent.id]);
   res.json({success:true,amount_added:+amount,new_balance:+rows[0].balance.toFixed(2),tx});
 });
 
 app.get('/v1/markets', async (req,res) => {
-  let {category,status='active',limit=20,offset=0,sort='volume'}=req.query;
+  let {category,status='active',limit=20,offset=0,sort='volume'} = req.query;
   limit=Math.min(+limit,100); offset=+offset;
-  let q='SELECT * FROM markets WHERE 1=1'; const p=[];
-  if (status!=='all'){q+=` AND status=$${p.length+1}`;p.push(status);}
-  if (category){q+=` AND category=$${p.length+1}`;p.push(category);}
+  let q = 'SELECT * FROM markets WHERE 1=1';
+  const p = [];
+  if (status!=='all') { q+=` AND status=$${p.length+1}`; p.push(status); }
+  if (category)       { q+=` AND category=$${p.length+1}`; p.push(category); }
   if (sort==='volume') q+=' ORDER BY volume DESC';
   else if (sort==='newest') q+=' ORDER BY created_at DESC';
   else if (sort==='closing_soon') q+=' ORDER BY closes_at ASC';
-  q+=` LIMIT $${p.length+1} OFFSET $${p.length+2}`;p.push(limit,offset);
-  const {rows:markets}=await pool.query(q,p);
-  for (const m of markets){const {rows:o}=await pool.query('SELECT * FROM outcomes WHERE market_id=$1',[m.id]);m.outcomes=o;}
-  const total=await pool.query('SELECT COUNT(*) as c FROM markets',[]);
+  q+=` LIMIT $${p.length+1} OFFSET $${p.length+2}`; p.push(limit,offset);
+  const {rows:markets} = await pool.query(q,p);
+  const total = await pool.query('SELECT COUNT(*) as c FROM markets WHERE status=$1',[status==='all'?'active':status]);
+  for (const m of markets) {
+    const {rows:outcomes} = await pool.query('SELECT * FROM outcomes WHERE market_id=$1',[m.id]);
+    m.outcomes = outcomes;
+  }
   res.json({markets,total:+total.rows[0].c,limit,offset});
 });
 
 app.get('/v1/markets/:id', auth, async (req,res) => {
-  const {rows}=await pool.query('SELECT * FROM markets WHERE id=$1',[req.params.id]);
+  const {rows} = await pool.query('SELECT * FROM markets WHERE id=$1',[req.params.id]);
   if (!rows[0]) return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Market not found.'}});
-  const {rows:outcomes}=await pool.query('SELECT * FROM outcomes WHERE market_id=$1',[req.params.id]);
+  const {rows:outcomes} = await pool.query('SELECT * FROM outcomes WHERE market_id=$1',[req.params.id]);
   res.json({...rows[0],outcomes});
 });
 
 app.post('/v1/orders', auth, async (req,res) => {
-  const {market_id,outcome_id,side,amount,type='market'}=req.body;
-  const a=req.agent;
+  const {market_id,outcome_id,side,amount,type='market'} = req.body;
+  const a = req.agent;
   if (!market_id||!outcome_id||!side||!amount) return res.status(400).json({error:{code:400,type:'BAD_REQUEST',message:'market_id, outcome_id, side, amount required.'}});
   if (!['yes','no'].includes(side)) return res.status(400).json({error:{code:400,type:'INVALID_SIDE',message:'side must be yes or no.'}});
   if (+amount<1) return res.status(400).json({error:{code:400,type:'INVALID_AMOUNT',message:'Minimum 1 USDC.'}});
-  const {rows:[m]}=await pool.query('SELECT * FROM markets WHERE id=$1',[market_id]);
+  const {rows:[m]} = await pool.query('SELECT * FROM markets WHERE id=$1',[market_id]);
   if (!m) return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Market not found.'}});
   if (m.status!=='active') return res.status(422).json({error:{code:422,type:'MARKET_CLOSED',message:'Market already resolved.'}});
-  const {rows:[out]}=await pool.query('SELECT * FROM outcomes WHERE id=$1',[outcome_id]);
+  const {rows:[out]} = await pool.query('SELECT * FROM outcomes WHERE id=$1',[outcome_id]);
   if (!out) return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Outcome not found.'}});
-  const {rows:[fresh]}=await pool.query('SELECT balance FROM agents WHERE id=$1',[a.id]);
-  if (fresh.balance<+amount) return res.status(403).json({error:{code:403,type:'INSUFFICIENT_BALANCE',message:`Balance: $${fresh.balance.toFixed(2)} USDC. Deposit more USDC to continue.`}});
-  const fee=+(+amount*0.02).toFixed(4),price=side==='yes'?out.price_yes:out.price_no,shares=+((+amount-fee)/price).toFixed(4);
+  // Re-fetch fresh balance
+  const {rows:[fresh]} = await pool.query('SELECT balance FROM agents WHERE id=$1',[a.id]);
+  if (fresh.balance < +amount) return res.status(403).json({error:{code:403,type:'INSUFFICIENT_BALANCE',
+    message:`Balance: $${fresh.balance.toFixed(2)} USDC. Deposit more USDC to continue.`}});
+  const fee=+(+amount*0.02).toFixed(4);
+  const price=side==='yes'?out.price_yes:out.price_no;
+  const shares=+((+amount-fee)/price).toFixed(4);
   const oid=`ord_${uuidv4().split('-')[0]}`;
-  const d=Math.min(+amount/50000,0.05),ny=side==='yes'?Math.min(0.99,+(+out.price_yes+d).toFixed(4)):Math.max(0.01,+(+out.price_yes-d).toFixed(4));
+  const d=Math.min(+amount/50000,0.05);
+  const ny=side==='yes'?Math.min(0.99,+(+out.price_yes+d).toFixed(4)):Math.max(0.01,+(+out.price_yes-d).toFixed(4));
   await pool.query('BEGIN');
   await pool.query('UPDATE agents SET balance=balance-$1,total_trades=total_trades+1 WHERE id=$2',[+amount,a.id]);
   await pool.query('UPDATE markets SET volume=volume+$1 WHERE id=$2',[+amount,market_id]);
   await pool.query('UPDATE outcomes SET price_yes=$1,price_no=$2 WHERE id=$3',[ny,+(1-ny).toFixed(4),outcome_id]);
-  const {rows:[order]}=await pool.query('INSERT INTO orders (id,agent_id,market_id,outcome_id,side,amount_spent,shares,avg_price,fee,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',[oid,a.id,market_id,outcome_id,side,+amount,shares,+price.toFixed(4),fee,'filled']);
+  const {rows:[order]} = await pool.query(
+    'INSERT INTO orders (id,agent_id,market_id,outcome_id,side,amount_spent,shares,avg_price,fee,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+    [oid,a.id,market_id,outcome_id,side,+amount,shares,+price.toFixed(4),fee,'filled']);
   await pool.query('COMMIT');
-  res.status(201).json({order_id:order.id,agent_id:a.id,market_id,market_title:m.title,outcome_id,outcome_label:out.label,side,amount_spent:+amount,shares_received:shares,avg_price:+price.toFixed(4),fee,potential_payout:+shares.toFixed(4),type,status:'filled',pnl:null,result:null,timestamp:order.created_at});
+  res.status(201).json({order_id:order.id,agent_id:a.id,market_id,market_title:m.title,outcome_id,
+    outcome_label:out.label,side,amount_spent:+amount,shares_received:shares,avg_price:+price.toFixed(4),
+    fee,potential_payout:+shares.toFixed(4),type,status:'filled',pnl:null,result:null,timestamp:order.created_at});
 });
 
 app.get('/v1/orders', auth, async (req,res) => {
-  let {status,market_id,limit=50,offset=0}=req.query;
+  let {status,market_id,limit=50,offset=0} = req.query;
   limit=Math.min(+limit,200); offset=+offset;
   let q='SELECT o.*,m.title as market_title,oc.label as outcome_label FROM orders o JOIN markets m ON o.market_id=m.id JOIN outcomes oc ON o.outcome_id=oc.id WHERE o.agent_id=$1';
   const p=[req.agent.id];
   if (status&&status!=='all'){q+=` AND o.status=$${p.length+1}`;p.push(status);}
   if (market_id){q+=` AND o.market_id=$${p.length+1}`;p.push(market_id);}
   q+=` ORDER BY o.created_at DESC LIMIT $${p.length+1} OFFSET $${p.length+2}`;p.push(limit,offset);
-  const {rows}=await pool.query(q,p);
-  const total=await pool.query('SELECT COUNT(*) as c FROM orders WHERE agent_id=$1',[req.agent.id]);
-  res.json({orders:rows.map(o=>({...o,order_id:o.id,shares_received:o.shares,timestamp:o.created_at})),total:+total.rows[0].c});
+  const {rows} = await pool.query(q,p);
+  const total = await pool.query('SELECT COUNT(*) as c FROM orders WHERE agent_id=$1',[req.agent.id]);
+  res.json({orders:rows.map(o=>({...o,order_id:o.id,shares_received:o.shares,amount_spent:o.amount_spent,timestamp:o.created_at})),total:+total.rows[0].c});
 });
 
 app.post('/v1/orders/sell', auth, async (req,res) => {
-  const {order_id}=req.body;
+  const {order_id} = req.body;
   if (!order_id) return res.status(400).json({error:{code:400,type:'BAD_REQUEST',message:'order_id required.'}});
-  const {rows:[o]}=await pool.query('SELECT o.*,oc.price_yes,oc.price_no FROM orders o JOIN outcomes oc ON o.outcome_id=oc.id WHERE o.id=$1',[order_id]);
+  const {rows:[o]} = await pool.query('SELECT o.*,oc.price_yes,oc.price_no FROM orders o JOIN outcomes oc ON o.outcome_id=oc.id WHERE o.id=$1',[order_id]);
   if (!o) return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Order not found.'}});
   if (o.agent_id!==req.agent.id) return res.status(403).json({error:{code:403,type:'FORBIDDEN',message:'Not your order.'}});
   if (o.pnl!==null) return res.status(422).json({error:{code:422,type:'ALREADY_CLOSED',message:'Position already closed.'}});
-  const cp=o.side==='yes'?o.price_yes:o.price_no,payout=+(o.shares*cp).toFixed(4),fee=+(payout*0.02).toFixed(4),net=+(payout-fee).toFixed(4),pnl=+(net-o.amount_spent).toFixed(4);
+  const cp=o.side==='yes'?o.price_yes:o.price_no;
+  const payout=+(o.shares*cp).toFixed(4);
+  const fee=+(payout*0.02).toFixed(4);
+  const net=+(payout-fee).toFixed(4);
+  const pnl=+(net-o.amount_spent).toFixed(4);
   await pool.query('BEGIN');
-  await pool.query('UPDATE agents SET balance=balance+$1,total_pnl=total_pnl+$2,wins=wins+$3,losses=losses+$4 WHERE id=$5',[net,pnl,pnl>0?1:0,pnl<=0?1:0,req.agent.id]);
-  await pool.query('UPDATE orders SET pnl=$1,result=$2,payout=$3,status=$4,closed_at=NOW() WHERE id=$5',[pnl,pnl>0?'won':'lost',net,'closed',order_id]);
+  await pool.query('UPDATE agents SET balance=balance+$1,total_pnl=total_pnl+$2,wins=wins+$3,losses=losses+$4 WHERE id=$5',
+    [net,pnl,pnl>0?1:0,pnl<=0?1:0,req.agent.id]);
+  await pool.query('UPDATE orders SET pnl=$1,result=$2,payout=$3,status=$4,closed_at=NOW() WHERE id=$5',
+    [pnl,pnl>0?'won':'lost',net,'closed',order_id]);
   await pool.query('COMMIT');
-  const {rows:[b]}=await pool.query('SELECT balance FROM agents WHERE id=$1',[req.agent.id]);
+  const {rows:[b]} = await pool.query('SELECT balance FROM agents WHERE id=$1',[req.agent.id]);
   res.json({order_id,shares_sold:o.shares,sell_price:cp,payout:net,fee,pnl,new_balance:+b.balance.toFixed(2)});
 });
 
 app.get('/v1/portfolio', auth, async (req,res) => {
-  const a=req.agent;
-  const {rows:[fresh]}=await pool.query('SELECT balance,total_pnl,total_trades FROM agents WHERE id=$1',[a.id]);
-  const {rows:[open]}=await pool.query('SELECT COUNT(*) as c FROM orders WHERE agent_id=$1 AND pnl IS NULL',[a.id]);
-  const {rows:[rank]}=await pool.query('SELECT COUNT(*)+1 as r FROM agents WHERE total_pnl > $1',[fresh.total_pnl]);
-  res.json({agent_id:a.id,balance_usdc:+fresh.balance.toFixed(2),total_pnl:+fresh.total_pnl.toFixed(2),total_trades:fresh.total_trades,open_positions:+open.c,leaderboard_rank:+rank.r});
+  const a = req.agent;
+  const {rows:[fresh]} = await pool.query('SELECT balance,total_pnl,total_trades FROM agents WHERE id=$1',[a.id]);
+  const {rows:[open]}  = await pool.query('SELECT COUNT(*) as c FROM orders WHERE agent_id=$1 AND pnl IS NULL',[a.id]);
+  const {rows:[rank]}  = await pool.query('SELECT COUNT(*)+1 as r FROM agents WHERE total_pnl > $1',[fresh.total_pnl]);
+  res.json({agent_id:a.id,balance_usdc:+fresh.balance.toFixed(2),total_pnl:+fresh.total_pnl.toFixed(2),
+    total_trades:fresh.total_trades,open_positions:+open.c,leaderboard_rank:+rank.r});
 });
 
 app.get('/v1/portfolio/positions', auth, async (req,res) => {
-  const {rows}=await pool.query(`SELECT o.id as order_id,o.market_id,o.outcome_id,o.side,o.shares,o.avg_price,o.amount_spent,m.title as market_title,oc.label as outcome_label,oc.price_yes,oc.price_no FROM orders o JOIN markets m ON o.market_id=m.id JOIN outcomes oc ON o.outcome_id=oc.id WHERE o.agent_id=$1 AND o.pnl IS NULL AND o.status='filled' ORDER BY o.created_at DESC`,[req.agent.id]);
-  res.json({positions:rows.map(p=>{const cp=p.side==='yes'?p.price_yes:p.price_no;return{order_id:p.order_id,market_id:p.market_id,market_title:p.market_title,outcome_label:p.outcome_label,side:p.side,shares:p.shares,avg_entry_price:p.avg_price,current_price:+cp.toFixed(4),unrealized_pnl:+(p.shares*cp-p.amount_spent).toFixed(2),potential_payout:+p.shares.toFixed(4)};}),total:rows.length});
+  const {rows} = await pool.query(`
+    SELECT o.id as order_id,o.market_id,o.outcome_id,o.side,o.shares,o.avg_price,o.amount_spent,
+           m.title as market_title,oc.label as outcome_label,oc.price_yes,oc.price_no
+    FROM orders o JOIN markets m ON o.market_id=m.id JOIN outcomes oc ON o.outcome_id=oc.id
+    WHERE o.agent_id=$1 AND o.pnl IS NULL AND o.status='filled' ORDER BY o.created_at DESC`,[req.agent.id]);
+  const positions = rows.map(p=>{
+    const cp=p.side==='yes'?p.price_yes:p.price_no;
+    return {order_id:p.order_id,market_id:p.market_id,market_title:p.market_title,outcome_label:p.outcome_label,
+      side:p.side,shares:p.shares,avg_entry_price:p.avg_price,current_price:+cp.toFixed(4),
+      unrealized_pnl:+(p.shares*cp-p.amount_spent).toFixed(2),potential_payout:+p.shares.toFixed(4)};
+  });
+  res.json({positions,total:positions.length});
 });
 
 app.get('/v1/portfolio/history', auth, async (req,res) => {
   const limit=Math.min(+(req.query.limit||20),100);
-  const {rows}=await pool.query(`SELECT o.*,m.title as market_title,oc.label as outcome_label FROM orders o JOIN markets m ON o.market_id=m.id JOIN outcomes oc ON o.outcome_id=oc.id WHERE o.agent_id=$1 AND o.pnl IS NOT NULL ORDER BY o.closed_at DESC LIMIT $2`,[req.agent.id,limit]);
-  res.json({trades:rows.map(o=>({...o,order_id:o.id,shares_received:o.shares,timestamp:o.created_at})),total:rows.length});
+  const {rows} = await pool.query(`
+    SELECT o.*,m.title as market_title,oc.label as outcome_label
+    FROM orders o JOIN markets m ON o.market_id=m.id JOIN outcomes oc ON o.outcome_id=oc.id
+    WHERE o.agent_id=$1 AND o.pnl IS NOT NULL ORDER BY o.closed_at DESC LIMIT $2`,[req.agent.id,limit]);
+  res.json({trades:rows.map(o=>({...o,order_id:o.id,amount_spent:o.amount_spent,shares_received:o.shares,timestamp:o.created_at})),total:rows.length});
 });
 
 app.get('/v1/leaderboard', auth, async (req,res) => {
   const limit=Math.min(+(req.query.limit||20),100);
-  const {rows}=await pool.query('SELECT id as agent_id,name,provider,balance,total_pnl,total_trades,wins FROM agents ORDER BY total_pnl DESC LIMIT $1',[limit]);
-  res.json({leaderboard:rows.map((a,i)=>({rank:i+1,agent_id:a.agent_id,name:a.name,provider:a.provider,balance_usdc:+a.balance.toFixed(2),total_pnl:+a.total_pnl.toFixed(2),win_rate:a.total_trades?+(a.wins/a.total_trades).toFixed(2):null,total_trades:a.total_trades}))});
+  const {rows} = await pool.query(`
+    SELECT id as agent_id,name,provider,balance,total_pnl,total_trades,wins
+    FROM agents ORDER BY total_pnl DESC LIMIT $1`,[limit]);
+  res.json({leaderboard:rows.map((a,i)=>({rank:i+1,agent_id:a.agent_id,name:a.name,provider:a.provider,
+    balance_usdc:+a.balance.toFixed(2),total_pnl:+a.total_pnl.toFixed(2),
+    win_rate:a.total_trades?+(a.wins/a.total_trades).toFixed(2):null,total_trades:a.total_trades}))});
 });
 
 app.post('/v1/admin/resolve', async (req,res) => {
-  const {admin_key,market_id,winning_outcome_id}=req.body;
-  if (admin_key!==(process.env.ADMIN_KEY||'ponemarket_admin_2026')) return res.status(403).json({error:{code:403,type:'FORBIDDEN',message:'Invalid admin key.'}});
-  const {rows:[m]}=await pool.query('SELECT * FROM markets WHERE id=$1',[market_id]);
+  const {admin_key,market_id,winning_outcome_id} = req.body;
+  if (admin_key!==(process.env.ADMIN_KEY||'ponemarket_admin_2026'))
+    return res.status(403).json({error:{code:403,type:'FORBIDDEN',message:'Invalid admin key.'}});
+  const {rows:[m]} = await pool.query('SELECT * FROM markets WHERE id=$1',[market_id]);
   if (!m) return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Market not found.'}});
-  const {rows:orders}=await pool.query('SELECT * FROM orders WHERE market_id=$1 AND pnl IS NULL',[market_id]);
+  const {rows:orders} = await pool.query('SELECT * FROM orders WHERE market_id=$1 AND pnl IS NULL',[market_id]);
   await pool.query('UPDATE markets SET status=$1,resolved_at=NOW() WHERE id=$2',['resolved',market_id]);
   for (const o of orders) {
     const won=(o.outcome_id===winning_outcome_id&&o.side==='yes')||(o.outcome_id!==winning_outcome_id&&o.side==='no');
-    const payout=won?o.shares:0,pnl=+(payout-o.amount_spent).toFixed(4);
-    await pool.query('UPDATE orders SET pnl=$1,result=$2,payout=$3,status=$4,closed_at=NOW() WHERE id=$5',[pnl,won?'won':'lost',payout,'closed',o.id]);
+    const payout=won?o.shares:0, pnl=+(payout-o.amount_spent).toFixed(4);
+    await pool.query('UPDATE orders SET pnl=$1,result=$2,payout=$3,status=$4,closed_at=NOW() WHERE id=$5',
+      [pnl,won?'won':'lost',payout,'closed',o.id]);
     if (payout>0) await pool.query('UPDATE agents SET balance=balance+$1,total_pnl=total_pnl+$2,wins=wins+1 WHERE id=$3',[payout,pnl,o.agent_id]);
     else await pool.query('UPDATE agents SET total_pnl=total_pnl+$1,losses=losses+1 WHERE id=$2',[pnl,o.agent_id]);
   }
   res.json({market_id,status:'resolved',winning_outcome_id,orders_resolved:orders.length});
 });
 
-const PORT=process.env.PORT||3000;
+// ── POLYMARKET AUTO-SYNC ──────────────────────────────────────
+function detectCategory(title) {
+  title = title.toLowerCase();
+  if (title.includes('bitcoin')||title.includes('btc')||title.includes('eth')||title.includes('crypto')||title.includes('solana')) return 'crypto';
+  if (title.includes('election')||title.includes('trump')||title.includes('president')||title.includes('congress')||title.includes('vote')) return 'politics';
+  if (title.includes('fed')||title.includes('rate')||title.includes('inflation')||title.includes('gdp')||title.includes('recession')) return 'finance';
+  if (title.includes('nba')||title.includes('nfl')||title.includes('fifa')||title.includes('soccer')||title.includes('football')) return 'sports';
+  if (title.includes('ai')||title.includes('gpt')||title.includes('openai')||title.includes('tech')||title.includes('apple')) return 'tech';
+  if (title.includes('war')||title.includes('ukraine')||title.includes('russia')||title.includes('china')||title.includes('taiwan')) return 'geopolitics';
+  return 'general';
+}
+
+async function syncFromPolymarket() {
+  try {
+    console.log('🔄 Syncing markets from Polymarket...');
+    const res = await fetch('https://gamma-api.polymarket.com/markets?closed=false&limit=50&order=volume&ascending=false');
+    if (!res.ok) throw new Error('Polymarket API error: ' + res.status);
+    const markets = await res.json();
+    let added=0, updated=0;
+    for (const m of markets) {
+      if (!m.question||!m.endDate) continue;
+      const id = 'poly_' + (m.id||'').toString().slice(0,12);
+      const title = m.question;
+      const category = detectCategory(title);
+      const closes_at = m.endDate;
+      const volume = parseFloat(m.volume||0);
+      const existing = await pool.query('SELECT id FROM markets WHERE id=$1',[id]);
+      if (existing.rows.length===0) {
+        await pool.query('INSERT INTO markets (id,title,category,closes_at,volume) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
+          [id,title,category,closes_at,volume]);
+        const tokens = m.tokens||[];
+        if (tokens.length>0) {
+          for (const t of tokens) {
+            const oid='po_'+id+'_'+(t.outcome||'yes').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,10);
+            const py=parseFloat(t.price||0.5);
+            await pool.query('INSERT INTO outcomes (id,market_id,label,price_yes,price_no) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
+              [oid,id,t.outcome||'Yes',py,+(1-py).toFixed(2)]);
+          }
+        } else {
+          const py=parseFloat((m.outcomePrices||['0.5'])[0]);
+          await pool.query('INSERT INTO outcomes (id,market_id,label,price_yes,price_no) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
+            ['po_'+id+'_yes',id,'Yes',py,+(1-py).toFixed(2)]);
+        }
+        added++;
+      } else {
+        await pool.query('UPDATE markets SET volume=$1 WHERE id=$2',[volume,id]);
+        const tokens = m.tokens||[];
+        for (const t of tokens) {
+          const oid='po_'+id+'_'+(t.outcome||'yes').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,10);
+          const py=parseFloat(t.price||0.5);
+          await pool.query('UPDATE outcomes SET price_yes=$1,price_no=$2 WHERE id=$3',[py,+(1-py).toFixed(2),oid]);
+        }
+        updated++;
+      }
+    }
+    console.log('✅ Polymarket sync: '+added+' added, '+updated+' updated');
+    return {added,updated};
+  } catch(e) {
+    console.error('❌ Polymarket sync failed:',e.message);
+    return {error:e.message};
+  }
+}
+
+app.post('/v1/admin/sync-markets', async (req,res) => {
+  const {admin_key}=req.body;
+  if (admin_key!==(process.env.ADMIN_KEY||'ponemarket_admin_2026'))
+    return res.status(403).json({error:{code:403,type:'FORBIDDEN',message:'Invalid admin key.'}});
+  const result=await syncFromPolymarket();
+  res.json(result);
+});
+
+app.get('/v1/markets/sync-status', async (req,res) => {
+  const total=await pool.query('SELECT COUNT(*) as c FROM markets WHERE status=$1',['active']);
+  const poly=await pool.query("SELECT COUNT(*) as c FROM markets WHERE id LIKE 'poly_%'");
+  res.json({total_markets:+total.rows[0].c,polymarket_markets:+poly.rows[0].c});
+});
+
+const PORT = process.env.PORT||3000;
 initDB().then(()=>{
+  syncFromPolymarket();
+  setInterval(syncFromPolymarket, 6*60*60*1000);
+
   app.listen(PORT,()=>console.log(`\n  PoneMarket API v2 (PostgreSQL) → http://localhost:${PORT}\n`));
-}).catch(e=>{console.error('DB init failed:',e);process.exit(1);});
+}).catch(e=>{ console.error('DB init failed:', e); process.exit(1); });
