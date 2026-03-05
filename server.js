@@ -39,6 +39,40 @@ app.get('/v1/markets/:id',auth,(req,res)=>{const m=DB.markets[req.params.id];if(
 app.get('/v1/markets/:id/orderbook',auth,(req,res)=>{const m=DB.markets[req.params.id];if(!m)return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Market not found.'}});const p=m.outcomes[0].price_yes;res.json({market_id:m.id,outcome_id:m.outcomes[0].id,bids:[{price:+(p-.01).toFixed(2),size:Math.floor(Math.random()*8000+2000)},{price:+(p-.02).toFixed(2),size:Math.floor(Math.random()*15000+5000)}],asks:[{price:+(p+.01).toFixed(2),size:Math.floor(Math.random()*6000+1000)},{price:+(p+.02).toFixed(2),size:Math.floor(Math.random()*12000+3000)}],timestamp:new Date().toISOString()});});
 app.post('/v1/orders',auth,(req,res)=>{const{market_id,outcome_id,side,amount,type='market'}=req.body;const a=req.agent;if(!market_id||!outcome_id||!side||!amount)return res.status(400).json({error:{code:400,type:'BAD_REQUEST',message:'market_id, outcome_id, side, amount required.'}});if(!['yes','no'].includes(side))return res.status(400).json({error:{code:400,type:'INVALID_SIDE',message:'side must be yes or no.'}});if(amount<1)return res.status(400).json({error:{code:400,type:'INVALID_AMOUNT',message:'Minimum 1 USDC.'}});const m=DB.markets[market_id];if(!m)return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Market not found.'}});if(m.status!=='active')return res.status(422).json({error:{code:422,type:'MARKET_CLOSED',message:'Market already resolved.'}});const out=m.outcomes.find(o=>o.id===outcome_id);if(!out)return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Outcome not found.'}});if(a.balance_usdc<amount)return res.status(403).json({error:{code:403,type:'INSUFFICIENT_BALANCE',message:`Balance: ${a.balance_usdc.toFixed(2)} USDC.`}});const fee=+(amount*0.02).toFixed(4);const price=side==='yes'?out.price_yes:out.price_no;const shares=+((amount-fee)/price).toFixed(4);a.balance_usdc-=amount;a.total_invested+=amount;a.total_trades+=1;impact(out,side,amount);m.volume+=amount;const oid='ord_'+uuidv4().split('-')[0];const order={order_id:oid,agent_id:a.agent_id,market_id,market_title:m.title,outcome_id,outcome_label:out.label,side,amount_spent:+amount,shares_received:shares,avg_price:+price.toFixed(4),fee,potential_payout:+shares.toFixed(4),type,status:'filled',pnl:null,result:null,timestamp:new Date().toISOString()};DB.orders[oid]=order;res.status(201).json(order);});
 app.get('/v1/orders',auth,(req,res)=>{let{status,market_id,limit=50,offset=0}=req.query;limit=Math.min(+limit,200);offset=+offset;let os=Object.values(DB.orders).filter(o=>o.agent_id===req.agent.agent_id);if(status&&status!=='all')os=os.filter(o=>o.status===status);if(market_id)os=os.filter(o=>o.market_id===market_id);os.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));res.json({orders:os.slice(offset,offset+limit),total:os.length});});
+// SELL endpoint — close a position
+app.post('/v1/orders/sell',auth,(req,res)=>{
+  const{order_id,amount}=req.body;
+  const a=req.agent;
+  if(!order_id)return res.status(400).json({error:{code:400,type:'BAD_REQUEST',message:'order_id required.'}});
+  const o=DB.orders[order_id];
+  if(!o)return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Order not found.'}});
+  if(o.agent_id!==a.agent_id)return res.status(403).json({error:{code:403,type:'FORBIDDEN',message:'Not your order.'}});
+  if(o.pnl!==null)return res.status(422).json({error:{code:422,type:'ALREADY_CLOSED',message:'Position already closed.'}});
+  const m=DB.markets[o.market_id];
+  if(!m)return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Market not found.'}});
+  const out=m.outcomes.find(x=>x.id===o.outcome_id);
+  if(!out)return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Outcome not found.'}});
+  // Current price for the side held
+  const currentPrice=o.side==='yes'?out.price_yes:out.price_no;
+  const sharesToSell=amount?Math.min(+amount,o.shares_received):o.shares_received;
+  const payout=+(sharesToSell*currentPrice).toFixed(4);
+  const fee=+(payout*0.02).toFixed(4);
+  const netPayout=+(payout-fee).toFixed(4);
+  const pnl=+(netPayout-o.amount_spent*(sharesToSell/o.shares_received)).toFixed(4);
+  // Update agent balance
+  a.balance_usdc+=netPayout;
+  a.total_pnl+=pnl;
+  pnl>0?a.wins++:a.losses++;
+  // Mark order closed
+  o.pnl=pnl;
+  o.result=pnl>0?'won':'lost';
+  o.payout=netPayout;
+  o.sold_at=new Date().toISOString();
+  o.sell_price=currentPrice;
+  o.shares_sold=sharesToSell;
+  res.json({order_id:o.order_id,shares_sold:sharesToSell,sell_price:currentPrice,payout:netPayout,fee,pnl,new_balance:+a.balance_usdc.toFixed(2)});
+});
+
 app.delete('/v1/orders/:id',auth,(req,res)=>{const o=DB.orders[req.params.id];if(!o)return res.status(404).json({error:{code:404,type:'NOT_FOUND',message:'Order not found.'}});if(o.agent_id!==req.agent.agent_id)return res.status(403).json({error:{code:403,type:'FORBIDDEN',message:'Not your order.'}});if(o.status==='filled')return res.status(422).json({error:{code:422,type:'ALREADY_FILLED',message:'Cannot cancel filled order.'}});o.status='cancelled';req.agent.balance_usdc+=o.amount_spent;res.json({order_id:o.order_id,status:'cancelled'});});
 app.get('/v1/portfolio',auth,(req,res)=>{const a=req.agent;const rank=Object.values(DB.agents).sort((x,y)=>y.total_pnl-x.total_pnl).findIndex(x=>x.agent_id===a.agent_id)+1;const open=Object.values(DB.orders).filter(o=>o.agent_id===a.agent_id&&o.pnl===null).length;res.json({agent_id:a.agent_id,balance_usdc:+a.balance_usdc.toFixed(2),total_invested:+a.total_invested.toFixed(2),total_pnl:+a.total_pnl.toFixed(2),pnl_pct:a.total_invested>0?+((a.total_pnl/a.total_invested)*100).toFixed(2):0,win_rate:a.total_trades?+(a.wins/a.total_trades).toFixed(2):null,total_trades:a.total_trades,open_positions:open,leaderboard_rank:rank});});
 app.get('/v1/portfolio/positions',auth,(req,res)=>{const positions=Object.values(DB.orders).filter(o=>o.agent_id===req.agent.agent_id&&o.status==='filled'&&o.pnl===null).map(o=>{const m=DB.markets[o.market_id];const out=m?.outcomes.find(x=>x.id===o.outcome_id);const cp=out?(o.side==='yes'?out.price_yes:out.price_no):o.avg_price;return{order_id:o.order_id,market_id:o.market_id,market_title:o.market_title,outcome_label:o.outcome_label,side:o.side,shares:o.shares_received,avg_entry_price:o.avg_price,current_price:+cp.toFixed(4),unrealized_pnl:+(o.shares_received*cp-o.amount_spent).toFixed(2),potential_payout:o.potential_payout};});res.json({positions,total:positions.length});});
