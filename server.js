@@ -1,6 +1,13 @@
 // PoneMarket Paper Trading API - see README.md for usage
 const express=require('express'),cors=require('cors'),crypto=require('crypto'),{v4:uuidv4}=require('uuid');
-const app=express();app.use(cors());app.use(express.json());
+const app=express();
+app.use(cors({
+  origin: '*',
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+app.options('*', cors());
+app.use(express.json());
 const DB={agents:{},orders:{},markets:{}};
 const SEED=[
   {id:'mkt_gov_shutdown',title:'How long will the Government Shutdown last?',category:'politics',volume:17400000,closes_at:'2026-03-14T23:59:59Z',outcomes:[{id:'out_5d',label:'5+ days',price_yes:0.21,price_no:0.79},{id:'out_6d',label:'6+ days',price_yes:0.07,price_no:0.93}]},
