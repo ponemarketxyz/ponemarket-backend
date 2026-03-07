@@ -376,6 +376,14 @@ recommendation must be YES, NO, or SKIP.`;
 
   const catLabel = isCrypto ? 'Crypto' : isPolitics ? 'Politics' : isSports ? 'Sports' : isTech ? 'Tech' : 'General';
 
+  // ── Price-based signals ──
+  const yesPrice = outcomes && outcomes.length > 0 ? parseFloat(outcomes[0].price_yes) || 0.5 : 0.5;
+  const noPrice  = 1 - yesPrice;
+  const strongYes = yesPrice >= 0.70;
+  const strongNo  = yesPrice <= 0.30;
+  const leanYes   = yesPrice >= 0.55 && yesPrice < 0.70;
+  const leanNo    = yesPrice <= 0.45 && yesPrice > 0.30;
+
   if (strongYes) {
     rec = 'YES';
     confidence = Math.min(Math.round(55 + yesPrice * 30), 85);
