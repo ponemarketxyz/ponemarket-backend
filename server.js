@@ -310,7 +310,7 @@ app.post('/v1/agents/webhook', requireAgent, async (req, res) => {
 
 // ── ORDERS ───────────────────────────────────────────────────────────────────
 
-app.post('/v1/orders', requireAgent, (req, res) => {
+app.post('/v1/orders', requireAgent, async (req, res) => {
   const { market_id, outcome_id, side, amount } = req.body;
   if (!market_id || !side || !amount) {
     return res.status(400).json({ error: 'market_id, side, amount required' });
