@@ -67,6 +67,13 @@ async function initDB() {
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS api_key TEXT",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS market_title TEXT",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS outcome_label TEXT",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS amount NUMERIC",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS price NUMERIC",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shares NUMERIC",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS potential_payout NUMERIC",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS outcome_id TEXT",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'filled'",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TEXT",
   ];
   for (const sql of migrations) {
     await pool.query(sql).catch(() => {});
@@ -113,8 +120,13 @@ const db = {
   },
   async getOrders(agentId) {
     if (!process.env.DATABASE_URL) return _orders.filter(o => o.agent_id === agentId);
-    const r = await pool.query('SELECT * FROM orders WHERE agent_id=$1 ORDER BY created_at DESC', [agentId]);
-    return r.rows;
+    try {
+      const r = await pool.query('SELECT * FROM orders WHERE agent_id=$1 ORDER BY created_at DESC NULLS LAST', [agentId]);
+      return r.rows;
+    } catch(e) {
+      console.error('getOrders error:', e.message);
+      return [];
+    }
   },
   async deleteOrder(orderId, agentId) {
     if (!process.env.DATABASE_URL) {
@@ -438,6 +450,12 @@ app.get('/v1/leaderboard', async (req, res) => {
       win_rate: a.win_rate,
     }));
   res.json({ leaderboard: board });
+});
+
+// ── DEBUG ────────────────────────────────────────────────────────────────────
+app.get('/v1/debug/orders', requireAgent, async (req, res) => {
+  const orders = await db.getOrders(req.agent.id);
+  res.json({ agent_id: req.agent.id, count: orders.length, orders });
 });
 
 // ── WALLET SYNC ──────────────────────────────────────────────────────────────
