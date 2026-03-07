@@ -56,11 +56,26 @@ app.get('/v1/markets', async (req, res) => {
       const raw = await r.json();
       // Normalize to our format with real prices
       marketsCache = raw.map(m => {
-        const outcomes = m.tokens ? m.tokens.map(t => ({
-          label: t.outcome,
-          price_yes: parseFloat(t.price) || 0.5,
-          price_no: 1 - (parseFloat(t.price) || 0.5),
-        })) : [];
+        // Polymarket uses outcomePrices (stringified array) + outcomes (array of strings)
+        let outcomes = [];
+        try {
+          const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : (m.outcomePrices || []);
+          const labels = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : (m.outcomes || []);
+          outcomes = labels.map((label, i) => ({
+            label,
+            price_yes: parseFloat(prices[i]) || 0.5,
+            price_no: 1 - (parseFloat(prices[i]) || 0.5),
+          }));
+        } catch(_) {
+          // fallback: tokens array
+          if (m.tokens && m.tokens.length) {
+            outcomes = m.tokens.map(t => ({
+              label: t.outcome,
+              price_yes: parseFloat(t.price) || 0.5,
+              price_no: 1 - (parseFloat(t.price) || 0.5),
+            }));
+          }
+        }
         return {
           id: m.id || m.conditionId,
           title: m.question || m.title,
