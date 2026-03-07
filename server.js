@@ -358,68 +358,37 @@ recommendation must be YES, NO, or SKIP.`;
   const medVol  = vol > 50000 || vol === 0; // default to medium if unknown
   const volLabel = highVol ? `$${(vol/1e6).toFixed(1)}M` : vol > 1000 ? `$${(vol/1000).toFixed(0)}K` : 'unknown';
 
-  if (skipScore > 0 || noEdge) {
-    rec = 'SKIP'; confidence = noEdge ? 50 : 48;
-    reasoning = noEdge
-      ? `No strong directional signals detected. At current odds, expected value is near zero — better opportunities elsewhere.`
-      : `This market asks for a precise prediction that's highly uncertain. Expected value is negative — pass.`;
-    size = 0;
-  } else if (isCrypto) {
-    if (yesScore >= noScore) {
-      rec = 'YES'; confidence = highVol ? 63 : 56;
-      reasoning = `Crypto market with bullish framing. ${highVol ? 'High liquidity ($'+volLabel+') supports price discovery.' : 'Moderate volume.'} Crypto tends to overshoot expectations in bull cycles.`;
-      size = highVol ? 50 : 25;
-    } else {
-      rec = 'NO'; confidence = highVol ? 61 : 54;
-      reasoning = `Crypto market with bearish framing. ${highVol ? 'High volume ($'+volLabel+') suggests strong consensus.' : 'Low liquidity adds risk.'} Downside targets often hit faster than expected.`;
-      size = highVol ? 40 : 20;
-    }
-  } else if (isPolitics) {
-    if (yesScore > noScore + 1) {
-      rec = 'YES'; confidence = highVol ? 67 : 58;
-      reasoning = `Political market with strong YES signals. ${highVol ? 'Volume ($'+volLabel+') indicates high market conviction.' : ''} Incumbency and momentum favor the leading outcome.`;
-      size = highVol ? 45 : 20;
-    } else if (noScore > yesScore + 1) {
-      rec = 'NO'; confidence = highVol ? 65 : 57;
-      reasoning = `Political market with strong NO signals. ${highVol ? 'Heavy trading ($'+volLabel+') signals informed sellers.' : ''} Political outcomes rarely deviate from polling consensus.`;
-      size = highVol ? 45 : 20;
-    } else {
-      rec = 'SKIP'; confidence = 52;
-      reasoning = `Political market with mixed signals. Too close to call — current odds of ~50% offer no edge. Avoid.`;
-      size = 0;
-    }
-  } else if (isSports) {
-    const edge = Math.abs(yesScore - noScore);
-    if (edge >= 2) {
-      rec = yesScore > noScore ? 'YES' : 'NO';
-      confidence = 61 + edge * 3;
-      reasoning = `Sports market with ${rec === 'YES' ? 'strong favorite signals' : 'underdog scenario'}. ${medVol ? 'Decent liquidity ($'+volLabel+').' : 'Low volume — size down.'} Historical win rates support this call.`;
-      size = medVol ? 35 : 15;
-    } else {
-      rec = 'SKIP'; confidence = 50;
-      reasoning = `Sports market too close to call at current odds. Coin-flip probabilities offer no positive expected value.`;
-      size = 0;
-    }
-  } else if (isTech) {
-    rec = yesScore >= noScore ? 'YES' : 'NO';
-    confidence = highVol ? 64 : medVol ? 58 : 52;
-    reasoning = `Tech/business market. ${rec === 'YES' ? 'Positive catalysts detected — companies tend to execute on announced plans.' : 'Risk factors detected — execution risk is high in tech.'} ${highVol ? 'Strong volume ($'+volLabel+') confirms market attention.' : ''}`;
-    size = highVol ? 40 : medVol ? 25 : 10;
+  const catLabel = isCrypto ? 'Crypto' : isPolitics ? 'Politics' : isSports ? 'Sports' : isTech ? 'Tech' : 'General';
+
+  if (strongYes) {
+    rec = 'YES';
+    confidence = Math.min(Math.round(55 + yesPrice * 30), 85);
+    reasoning = 'Market pricing YES at ' + Math.round(yesPrice*100) + '% — strong consensus. ' + catLabel + ' market, ' + volLabel + ' volume. High-conviction setup: informed buyers dominate. Follow the smart money.';
+    size = vol > 500000 ? 60 : vol > 100000 ? 40 : 25;
+  } else if (strongNo) {
+    rec = 'NO';
+    confidence = Math.min(Math.round(55 + noPrice * 30), 85);
+    reasoning = 'Market pricing YES at only ' + Math.round(yesPrice*100) + '% — overwhelmingly NO. ' + catLabel + ' market, ' + volLabel + ' volume. Strong NO signal from price action.';
+    size = vol > 500000 ? 60 : vol > 100000 ? 40 : 25;
+  } else if (leanYes) {
+    rec = 'YES';
+    confidence = Math.min(Math.round(52 + yesPrice * 20), 85);
+    reasoning = 'Market pricing YES at ' + Math.round(yesPrice*100) + '% — leaning positive. ' + catLabel + ' market, ' + volLabel + ' volume. Modest edge detected. Size conservatively.';
+    size = vol > 500000 ? 35 : vol > 100000 ? 20 : 10;
+  } else if (leanNo) {
+    rec = 'NO';
+    confidence = Math.min(Math.round(52 + noPrice * 20), 85);
+    reasoning = 'Market pricing YES at ' + Math.round(yesPrice*100) + '% — leaning negative. ' + catLabel + ' market, ' + volLabel + ' volume. Slight edge on NO side. Keep position small.';
+    size = vol > 500000 ? 35 : vol > 100000 ? 20 : 10;
   } else {
-    // General market
-    if (yesScore > noScore) {
-      rec = 'YES'; confidence = medVol ? 59 : 53;
-      reasoning = `Market framing suggests positive outcome more likely. ${medVol ? 'Sufficient volume ($'+volLabel+') for reliable price signal.' : 'Low volume — proceed with caution.'} Base rates favor the YES side here.`;
-      size = medVol ? 30 : 10;
-    } else if (noScore > yesScore) {
-      rec = 'NO'; confidence = medVol ? 58 : 52;
-      reasoning = `Market framing suggests negative outcome more likely. ${medVol ? 'Volume ($'+volLabel+') supports this thesis.' : 'Thin market — small position only.'} NO has better risk/reward at current pricing.`;
-      size = medVol ? 30 : 10;
-    } else {
-      rec = 'SKIP'; confidence = 50;
-      reasoning = `No clear edge detected in either direction. At 50/50 odds, expected value is zero. Wait for a better setup.`;
-      size = 0;
-    }
+    rec = 'SKIP';
+    confidence = 50;
+    reasoning = 'Market at ' + Math.round(yesPrice*100) + '% YES — essentially a coin flip. No edge at current pricing. ' + catLabel + ' market, ' + volLabel + ' volume. Wait for odds to move.';
+    size = 0;
+  }
+
+  // unused branch placeholder
+  if (false) { const isCrypto2 = false;
   }
 
   // Cap confidence at 85
