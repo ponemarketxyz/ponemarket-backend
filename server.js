@@ -88,7 +88,16 @@ app.get('/v1/markets', async (req, res) => {
           active: m.active,
           image: m.image,
         };
-      }).filter(m => m.title && m.active !== false);
+      }).filter(m => {
+        if (!m.title) return false;
+        if (m.active === false) return false;
+        // Filter out expired markets
+        if (m.closes_at) {
+          const closeDate = new Date(m.closes_at);
+          if (closeDate < new Date()) return false;
+        }
+        return true;
+      });
       marketsCacheTs = Date.now();
     }
 
