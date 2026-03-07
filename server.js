@@ -51,9 +51,29 @@ app.get('/v1/markets', async (req, res) => {
     const cat   = req.query.category;
 
     // cache 60 detik
-    if (!marketsCache || Date.now() - marketsCacheTs > 60_000) {
-      const r = await fetch(`${POLYMARKET}/markets?limit=100&active=true`);
-      marketsCache = await r.json();
+    if (!marketsCache || Date.now() - marketsCacheTs > 30_000) {
+      const r = await fetch(`${POLYMARKET}/markets?limit=100&active=true&closed=false&order=volume24hr&ascending=false`);
+      const raw = await r.json();
+      // Normalize to our format with real prices
+      marketsCache = raw.map(m => {
+        const outcomes = m.tokens ? m.tokens.map(t => ({
+          label: t.outcome,
+          price_yes: parseFloat(t.price) || 0.5,
+          price_no: 1 - (parseFloat(t.price) || 0.5),
+        })) : [];
+        return {
+          id: m.id || m.conditionId,
+          title: m.question || m.title,
+          category: m.category || 'other',
+          tags: m.tags || [],
+          volume: parseFloat(m.volume) || parseFloat(m.volume24hr) || 0,
+          volume_24h: parseFloat(m.volume24hr) || 0,
+          closes_at: m.endDate || m.endDateIso,
+          outcomes,
+          active: m.active,
+          image: m.image,
+        };
+      }).filter(m => m.title && m.active !== false);
       marketsCacheTs = Date.now();
     }
 
