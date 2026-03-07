@@ -335,13 +335,17 @@ recommendation must be YES, NO, or SKIP.`;
   let rec = 'SKIP', confidence = 50, reasoning = '', size = 0;
 
   // ── Keyword scoring ──
-  const yesSignals = ['will','win','pass','approve','succeed','launch','above','reach','increase','rise','gain','confirm','sign','declare','announce','beat','exceed','complete','achieve'];
-  const noSignals  = ['fail','lose','reject','below','crash','ban','block','decline','drop','miss','cancel','delay','collapse','impeach','resign','suspend'];
-  const skipSignals = ['predict','guess','exactly','precise','specific number','how many'];
+  // NOTE: Don't include 'will' - almost all Polymarket questions start with "Will..."
+  const yesSignals = ['win','pass','approve','succeed','launch','above','reach','increase','rise','gain','confirm','sign','beat','exceed','complete','achieve','re-elect','stay','remain','keep'];
+  const noSignals  = ['fail','lose','reject','below','crash','ban','block','decline','drop','miss','cancel','delay','collapse','impeach','resign','suspend','fall','never','not','without'];
+  const skipSignals = ['exactly','precise','specific number','how many','what price','what will'];
 
   const yesScore = yesSignals.filter(k => q.includes(k)).length;
   const noScore  = noSignals.filter(k => q.includes(k)).length;
   const skipScore = skipSignals.filter(k => q.includes(k)).length;
+
+  // If no clear signal either way, default to SKIP not YES
+  const noEdge = yesScore === 0 && noScore === 0;
 
   // ── Category detection ──
   const isCrypto   = /bitcoin|btc|eth|ethereum|crypto|sol|doge|coin/.test(q);
@@ -354,9 +358,11 @@ recommendation must be YES, NO, or SKIP.`;
   const medVol  = vol > 50000 || vol === 0; // default to medium if unknown
   const volLabel = highVol ? `$${(vol/1e6).toFixed(1)}M` : vol > 1000 ? `$${(vol/1000).toFixed(0)}K` : 'unknown';
 
-  if (skipScore > 0) {
-    rec = 'SKIP'; confidence = 48;
-    reasoning = `This market asks for a precise prediction that's highly uncertain. Expected value is negative — pass.`;
+  if (skipScore > 0 || noEdge) {
+    rec = 'SKIP'; confidence = noEdge ? 50 : 48;
+    reasoning = noEdge
+      ? `No strong directional signals detected. At current odds, expected value is near zero — better opportunities elsewhere.`
+      : `This market asks for a precise prediction that's highly uncertain. Expected value is negative — pass.`;
     size = 0;
   } else if (isCrypto) {
     if (yesScore >= noScore) {
