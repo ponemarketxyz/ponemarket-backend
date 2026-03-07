@@ -440,6 +440,22 @@ app.get('/v1/leaderboard', async (req, res) => {
   res.json({ leaderboard: board });
 });
 
+// ── WALLET SYNC ──────────────────────────────────────────────────────────────
+app.post('/v1/wallet/sync', requireAgent, async (req, res) => {
+  const { wallet, amount } = req.body;
+  if (!wallet || !amount) return res.status(400).json({ error: 'wallet and amount required' });
+
+  const newBalance = parseFloat(parseFloat(amount).toFixed(2));
+  req.agent.balance = newBalance;
+  await db.saveAgent(req.agent);
+
+  res.json({
+    message: 'Balance synced',
+    wallet,
+    new_balance: newBalance,
+  });
+});
+
 // ── AI ANALYSIS ─────────────────────────────────────────────────────────────
 app.post('/v1/ai/analyze', async (req, res) => {
   const { market_question, outcomes, volume } = req.body;
