@@ -51,7 +51,7 @@ async function initDB() {
       agent_id TEXT,
       api_key TEXT,
       market_id TEXT,
-      outcome_id TEXT DEFAULT NULL,
+      outcome_id TEXT,
       market_title TEXT,
       outcome_label TEXT,
       side TEXT,
@@ -84,6 +84,8 @@ async function initDB() {
     "ALTER TABLE orders ALTER COLUMN outcome_id DROP NOT NULL",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'filled'",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TEXT",
+    "ALTER TABLE orders ALTER COLUMN amount_spent DROP NOT NULL",
+    "ALTER TABLE orders ALTER COLUMN outcome_id DROP NOT NULL",
   ];
   for (const sql of migrations) {
     await pool.query(sql).catch(() => {});
@@ -124,7 +126,8 @@ const db = {
     await pool.query(`
       INSERT INTO orders (id,agent_id,api_key,market_id,outcome_id,market_title,outcome_label,side,amount,price,shares,potential_payout,status,created_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-    `, [order.id,order.agent_id,apiKey,order.market_id,order.outcome_id,order.market_title,
+      ON CONFLICT (id) DO NOTHING
+    `, [order.id,order.agent_id,apiKey,order.market_id,order.outcome_id||null,order.market_title,
         order.outcome_label,order.side,order.amount,order.price,order.shares,
         order.potential_payout,order.status,order.created_at]);
   },
@@ -630,6 +633,11 @@ app.post('/v1/ai/agent', requireAgent, async (req, res) => {
   } catch (e) {
     res.status(502).json({ error: 'Bankr agent error', detail: e.message });
   }
+});
+
+// ── GLOBAL ERROR HANDLER ────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
