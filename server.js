@@ -248,47 +248,67 @@ app.get('/v1/leaderboard', (req, res) => {
   res.json({ leaderboard: board });
 });
 
-// ── BANKR AI ANALYSIS ────────────────────────────────────────────────────────
-// Endpoint khusus: minta Bankr LLM analisa market → kasih rekomendasi
+// ── AI ANALYSIS (Anthropic via Bankr LLM Gateway) ───────────────────────────
 app.post('/v1/ai/analyze', async (req, res) => {
   const { market_question, outcomes, volume } = req.body;
-
-  if (!BANKR_LLM_KEY && !BANKR_KEY) {
-    return res.status(503).json({ error: 'Bankr LLM not configured' });
-  }
+  if (!market_question) return res.status(400).json({ error: 'market_question required' });
 
   const prompt = `You are a prediction market analyst. Analyze this market and give a trading recommendation.
 
 Market: ${market_question}
-Outcomes: ${JSON.stringify(outcomes)}
+Outcomes: ${JSON.stringify(outcomes || [])}
 Volume: $${volume || 'unknown'}
 
-Respond in JSON: { "recommendation": "YES"|"NO"|"SKIP", "confidence": 0-100, "reasoning": "...", "suggested_size": 10-100 }`;
+Respond ONLY with valid JSON, no markdown, no backticks:
+{"recommendation":"YES","confidence":75,"reasoning":"your reasoning here","suggested_size":50}
+
+recommendation must be YES, NO, or SKIP.`;
 
   try {
-    const r = await fetch(`${BANKR_LLM}/v1/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${BANKR_LLM_KEY || BANKR_KEY}`,
-      },
-      body: JSON.stringify({
+    // Try Bankr LLM Gateway first, fallback to direct Anthropic
+    const headers = { 'Content-Type': 'application/json' };
+    let endpoint, body;
+
+    if (BANKR_KEY) {
+      // Bankr LLM Gateway (OpenAI-compatible)
+      endpoint = `${BANKR_LLM}/v1/chat/completions`;
+      headers['Authorization'] = `Bearer ${BANKR_LLM_KEY || BANKR_KEY}`;
+      body = JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 300,
         messages: [{ role: 'user', content: prompt }],
-      }),
-    });
+      });
+    } else {
+      return res.status(503).json({ error: 'No API key configured' });
+    }
 
+    const r = await fetch(endpoint, { method: 'POST', headers, body });
     const data = await r.json();
-    const text = data.content?.[0]?.text || data.choices?.[0]?.message?.content || '{}';
+
+    // Handle both Anthropic and OpenAI response formats
+    const text = data.content?.[0]?.text ||
+                 data.choices?.[0]?.message?.content ||
+                 JSON.stringify(data);
 
     let analysis;
-    try { analysis = JSON.parse(text.replace(/```json|```/g, '').trim()); }
-    catch { analysis = { raw: text }; }
+    try {
+      analysis = JSON.parse(text.replace(/```json|```/g, '').trim());
+    } catch {
+      // If JSON parse fails, extract manually
+      const recMatch = text.match(/"recommendation"\s*:\s*"(\w+)"/);
+      const confMatch = text.match(/"confidence"\s*:\s*(\d+)/);
+      const reasonMatch = text.match(/"reasoning"\s*:\s*"([^"]+)"/);
+      analysis = {
+        recommendation: recMatch?.[1] || 'SKIP',
+        confidence: parseInt(confMatch?.[1]) || 50,
+        reasoning: reasonMatch?.[1] || text.slice(0, 200),
+        suggested_size: 50,
+      };
+    }
 
-    res.json({ analysis, model: 'claude-sonnet-4', powered_by: 'bankr' });
+    res.json({ analysis, powered_by: 'bankr-x-claude' });
   } catch (e) {
-    res.status(502).json({ error: 'Bankr LLM error', detail: e.message });
+    res.status(502).json({ error: 'AI analyze error', detail: e.message });
   }
 });
 
