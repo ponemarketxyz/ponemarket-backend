@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
@@ -251,7 +250,7 @@ app.get('/v1/leaderboard', (req, res) => {
 
 // ── BANKR AI ANALYSIS ────────────────────────────────────────────────────────
 // Endpoint khusus: minta Bankr LLM analisa market → kasih rekomendasi
-app.post('/v1/ai/analyze', requireAgent, async (req, res) => {
+app.post('/v1/ai/analyze', async (req, res) => {
   const { market_question, outcomes, volume } = req.body;
 
   if (!BANKR_LLM_KEY && !BANKR_KEY) {
