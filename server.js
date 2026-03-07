@@ -314,10 +314,10 @@ recommendation must be YES, NO, or SKIP.`;
   const isSports   = /win|championship|superbowl|nba|nfl|mlb|nhl|world cup|final|score/.test(q);
   const isTech     = /ipo|launch|release|acquire|merger|apple|google|microsoft|amazon|tesla/.test(q);
 
-  // ── Volume tiers ──
+  // ── Volume tiers ── (treat 0 as medium - volume may not always be passed)
   const highVol = vol > 1000000;
-  const medVol  = vol > 100000;
-  const volLabel = highVol ? `$${(vol/1e6).toFixed(1)}M` : medVol ? `$${(vol/1000).toFixed(0)}K` : `$${vol.toFixed(0)}`;
+  const medVol  = vol > 50000 || vol === 0; // default to medium if unknown
+  const volLabel = highVol ? `$${(vol/1e6).toFixed(1)}M` : vol > 1000 ? `$${(vol/1000).toFixed(0)}K` : 'unknown';
 
   if (skipScore > 0) {
     rec = 'SKIP'; confidence = 48;
