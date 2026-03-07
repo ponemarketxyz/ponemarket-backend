@@ -90,7 +90,7 @@ app.get('/v1/markets', async (req, res) => {
           tags: m.tags || [],
           volume: parseFloat(m.volume) || parseFloat(m.volume24hr) || 0,
           volume_24h: parseFloat(m.volume24hr) || 0,
-          closes_at: m.endDate || m.endDateIso,
+          closes_at: m.endDate || m.endDateIso || m.end_date_iso || m.expirationDate || m.closes_at,
           outcomes,
           active: m.active,
           image: m.image,
@@ -98,10 +98,11 @@ app.get('/v1/markets', async (req, res) => {
       }).filter(m => {
         if (!m.title) return false;
         if (m.active === false) return false;
-        // Filter out expired markets
-        if (m.closes_at) {
-          const closeDate = new Date(m.closes_at);
-          if (closeDate < new Date()) return false;
+        // Filter out expired markets - check all possible date fields
+        const closeStr = m.closes_at || m.endDate || m.endDateIso || m.end_date_iso || m.expirationDate;
+        if (closeStr) {
+          const closeDate = new Date(closeStr);
+          if (!isNaN(closeDate) && closeDate < new Date()) return false;
         }
         return true;
       });
