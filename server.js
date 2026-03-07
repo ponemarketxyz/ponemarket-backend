@@ -4,12 +4,24 @@ const fetch = require('node-fetch');
 const { Pool } = require('pg');
 
 const app = express();
-app.use(cors({
+const corsOptions = {
   origin: '*',
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
-}));
-app.options('*', cors());
+  optionsSuccessStatus: 200,
+};
+app.use(cors(corsOptions));
+app.options('*', (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  res.sendStatus(200);
+});
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  next();
+});
 app.use(express.json());
 
 // ── ENV ──────────────────────────────────────────────────────────────────────
@@ -160,6 +172,7 @@ async function requireAgent(req, res, next) {
   try {
     const agent = await db.getAgent(key);
     if (!agent) return res.status(401).json({ error: 'Invalid or missing API key' });
+    agent.api_key = key; // ensure api_key is always set on agent object
     req.agent = agent;
     req.apiKey = key;
     next();
