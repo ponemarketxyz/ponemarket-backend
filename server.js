@@ -51,7 +51,7 @@ async function initDB() {
       agent_id TEXT,
       api_key TEXT,
       market_id TEXT,
-      outcome_id TEXT,
+      outcome_id TEXT DEFAULT NULL,
       market_title TEXT,
       outcome_label TEXT,
       side TEXT,
@@ -81,6 +81,7 @@ async function initDB() {
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shares NUMERIC",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS potential_payout NUMERIC",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS outcome_id TEXT",
+    "ALTER TABLE orders ALTER COLUMN outcome_id DROP NOT NULL",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'filled'",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TEXT",
   ];
