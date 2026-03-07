@@ -36,6 +36,13 @@ function requireAgent(req, res, next) {
   next();
 }
 
+// ── CACHE CLEAR ──────────────────────────────────────────────────────────────
+app.get('/v1/cache/clear', (req, res) => {
+  marketsCache = null;
+  marketsCacheTs = 0;
+  res.json({ message: 'Cache cleared' });
+});
+
 // ── HEALTH ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', bankr: !!BANKR_KEY, ts: Date.now() });
