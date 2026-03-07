@@ -54,6 +54,23 @@ async function initDB() {
       created_at TEXT
     );
   `);
+  // Add missing columns to existing tables (safe to run multiple times)
+  const migrations = [
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS twitter TEXT",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS strategy TEXT",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS webhook_url TEXT",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS pnl NUMERIC DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS trades INTEGER DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS win_rate NUMERIC DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS bankr_wallet TEXT",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS registered_at TEXT",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS api_key TEXT",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS market_title TEXT",
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS outcome_label TEXT",
+  ];
+  for (const sql of migrations) {
+    await pool.query(sql).catch(() => {});
+  }
   console.log('✅ DB tables ready');
 }
 
