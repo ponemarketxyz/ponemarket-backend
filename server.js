@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -8,14 +10,35 @@ app.use(express.json());
 
 // ── ENV ──────────────────────────────────────────────────────────────────────
 const PORT          = process.env.PORT || 3000;
-const BANKR_KEY     = process.env.BANKR_API_KEY;          // bk_...
-const BANKR_LLM_KEY = process.env.BANKR_LLM_KEY;          // jika beda key untuk LLM
+const BANKR_KEY     = process.env.BANKR_API_KEY;
+const BANKR_LLM_KEY = process.env.BANKR_LLM_KEY;
 const POLYMARKET    = 'https://gamma-api.polymarket.com';
 const BANKR_API     = 'https://api.bankr.bot';
 const BANKR_LLM     = 'https://llm.bankr.bot';
 
-// In-memory agent store (ganti dengan DB di production)
+// In-memory stores (persisted to /tmp between restarts)
 const agents = new Map();
+const orders = [];
+
+// ── PERSISTENCE ──────────────────────────────────────────────────────────────
+const DATA_FILE = path.join('/tmp', 'ponemarket_data.json');
+
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      if (raw.agents) for (const [k,v] of Object.entries(raw.agents)) agents.set(k,v);
+      if (raw.orders) orders.push(...raw.orders);
+      console.log(`📦 Loaded ${agents.size} agents, ${orders.length} orders from disk`);
+    }
+  } catch(e) { console.warn('Could not load data:', e.message); }
+}
+
+function saveData() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ agents: Object.fromEntries(agents), orders, saved_at: new Date().toISOString() }), 'utf8');
+  } catch(e) { console.warn('Could not save data:', e.message); }
+}
 
 // ── HELPER ───────────────────────────────────────────────────────────────────
 function authHeader(req) {
@@ -208,7 +231,6 @@ app.post('/v1/agents/webhook', requireAgent, (req, res) => {
 });
 
 // ── ORDERS ───────────────────────────────────────────────────────────────────
-const orders = [];
 
 app.post('/v1/orders', requireAgent, (req, res) => {
   const { market_id, outcome_id, side, amount } = req.body;
@@ -216,25 +238,29 @@ app.post('/v1/orders', requireAgent, (req, res) => {
     return res.status(400).json({ error: 'market_id, side, amount required' });
   }
 
-  const price = Math.random() * 0.4 + 0.3; // mock price 30-70%
+  const { market_title, outcome_label } = req.body;
+  const price = Math.random() * 0.4 + 0.3; // mock fill price 30-70%
   const shares = amount / price;
   const order = {
     id: 'ord_' + Date.now(),
     agent_id: req.agent.id,
     market_id, outcome_id,
+    market_title: market_title || market_id,
+    outcome_label: outcome_label || (side === 'yes' ? 'Yes' : 'No'),
     side, amount,
     price: parseFloat(price.toFixed(4)),
     shares: parseFloat(shares.toFixed(2)),
-    potential_payout: parseFloat((shares).toFixed(2)),
+    potential_payout: parseFloat(shares.toFixed(2)),
     status: 'filled',
     created_at: new Date().toISOString(),
   };
 
-  req.agent.balance -= amount;
+  req.agent.balance = parseFloat((req.agent.balance - amount).toFixed(2));
   req.agent.trades++;
   orders.push(order);
+  saveData();
 
-  res.status(201).json(order);
+  res.status(201).json({ ...order, shares_received: order.shares });
 });
 
 app.get('/v1/orders', requireAgent, (req, res) => {
@@ -251,12 +277,15 @@ app.delete('/v1/orders/:id', requireAgent, (req, res) => {
 
 // ── PORTFOLIO ────────────────────────────────────────────────────────────────
 app.get('/v1/portfolio', requireAgent, (req, res) => {
+  const myOrders = orders.filter(o => o.agent_id === req.agent.id && o.status === 'filled');
+  const totalSpent = myOrders.reduce((s, o) => s + o.amount, 0);
   res.json({
-    balance: req.agent.balance,
-    pnl: req.agent.pnl,
-    trades: req.agent.trades,
-    win_rate: req.agent.win_rate,
+    balance_usdc: parseFloat(req.agent.balance.toFixed(2)),
+    total_pnl: parseFloat((req.agent.pnl || 0).toFixed(2)),
+    total_trades: req.agent.trades || 0,
+    win_rate: req.agent.win_rate || 0,
     bankr_wallet: req.agent.bankr_wallet,
+    total_invested: parseFloat(totalSpent.toFixed(2)),
   });
 });
 
@@ -264,23 +293,39 @@ app.get('/v1/portfolio/positions', requireAgent, (req, res) => {
   const positions = orders
     .filter(o => o.agent_id === req.agent.id && o.status === 'filled')
     .map(o => ({
+      order_id: o.id,
       market_id: o.market_id,
+      market_title: o.market_title || o.market_id,
+      outcome_label: o.outcome_label || (o.side === 'yes' ? 'Yes' : 'No'),
       side: o.side,
       shares: o.shares,
-      avg_price: o.price,
-      current_price: parseFloat((Math.random() * 0.4 + 0.3).toFixed(4)),
-      unrealized_pnl: parseFloat(((Math.random() - 0.5) * 20).toFixed(2)),
+      avg_entry_price: o.price,
+      current_price: o.price, // static until market resolves
+      unrealized_pnl: 0,
+      amount: o.amount,
+      created_at: o.created_at,
     }));
   res.json({ positions, count: positions.length });
 });
 
 app.get('/v1/portfolio/history', requireAgent, (req, res) => {
   const limit = parseInt(req.query.limit) || 10;
-  const history = orders
+  const trades = orders
     .filter(o => o.agent_id === req.agent.id)
     .slice(-limit)
-    .reverse();
-  res.json({ history, count: history.length });
+    .reverse()
+    .map(o => ({
+      id: o.id,
+      market_title: o.market_title || o.market_id,
+      side: o.side,
+      amount: o.amount,
+      shares: o.shares,
+      price: o.price,
+      status: o.status,
+      pnl: 0,
+      created_at: o.created_at,
+    }));
+  res.json({ trades, count: trades.length });
 });
 
 // ── LEADERBOARD ──────────────────────────────────────────────────────────────
@@ -448,6 +493,7 @@ app.post('/v1/ai/agent', requireAgent, async (req, res) => {
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
+loadData();
 app.listen(PORT, () => {
   console.log(`🚀 PoneMarket backend running on port ${PORT}`);
   console.log(`🤖 Bankr: ${BANKR_KEY ? '✅ connected' : '❌ not configured'}`);
