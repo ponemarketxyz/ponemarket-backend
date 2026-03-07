@@ -1,8 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
@@ -16,29 +15,100 @@ const POLYMARKET    = 'https://gamma-api.polymarket.com';
 const BANKR_API     = 'https://api.bankr.bot';
 const BANKR_LLM     = 'https://llm.bankr.bot';
 
-// In-memory stores (persisted to /tmp between restarts)
-const agents = new Map();
-const orders = [];
+// ── POSTGRES ─────────────────────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
 
-// ── PERSISTENCE ──────────────────────────────────────────────────────────────
-const DATA_FILE = path.join('/tmp', 'ponemarket_data.json');
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS agents (
+      api_key TEXT PRIMARY KEY,
+      id TEXT NOT NULL,
+      name TEXT,
+      twitter TEXT,
+      strategy TEXT,
+      webhook_url TEXT,
+      balance NUMERIC DEFAULT 1000,
+      pnl NUMERIC DEFAULT 0,
+      trades INTEGER DEFAULT 0,
+      win_rate NUMERIC DEFAULT 0,
+      bankr_wallet TEXT,
+      registered_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS orders (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT,
+      api_key TEXT,
+      market_id TEXT,
+      outcome_id TEXT,
+      market_title TEXT,
+      outcome_label TEXT,
+      side TEXT,
+      amount NUMERIC,
+      price NUMERIC,
+      shares NUMERIC,
+      potential_payout NUMERIC,
+      status TEXT DEFAULT 'filled',
+      created_at TEXT
+    );
+  `);
+  console.log('✅ DB tables ready');
+}
 
-function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      if (raw.agents) for (const [k,v] of Object.entries(raw.agents)) agents.set(k,v);
-      if (raw.orders) orders.push(...raw.orders);
-      console.log(`📦 Loaded ${agents.size} agents, ${orders.length} orders from disk`);
+// In-memory fallback (used if DATABASE_URL not set)
+const _agents = new Map();
+const _orders = [];
+
+// DB abstraction — uses Postgres if available, else in-memory
+const db = {
+  async getAgent(apiKey) {
+    if (!process.env.DATABASE_URL) return _agents.get(apiKey) || null;
+    const r = await pool.query('SELECT * FROM agents WHERE api_key=$1', [apiKey]);
+    return r.rows[0] || null;
+  },
+  async saveAgent(agent) {
+    if (!process.env.DATABASE_URL) { _agents.set(agent.api_key, agent); return; }
+    await pool.query(`
+      INSERT INTO agents (api_key,id,name,twitter,strategy,webhook_url,balance,pnl,trades,win_rate,bankr_wallet,registered_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT (api_key) DO UPDATE SET
+        balance=EXCLUDED.balance, pnl=EXCLUDED.pnl, trades=EXCLUDED.trades,
+        win_rate=EXCLUDED.win_rate, bankr_wallet=EXCLUDED.bankr_wallet,
+        webhook_url=EXCLUDED.webhook_url
+    `, [agent.api_key,agent.id,agent.name,agent.twitter,agent.strategy,agent.webhook_url,
+        agent.balance,agent.pnl,agent.trades,agent.win_rate,agent.bankr_wallet,agent.registered_at]);
+  },
+  async getAllAgents() {
+    if (!process.env.DATABASE_URL) return [..._agents.values()];
+    const r = await pool.query('SELECT * FROM agents ORDER BY balance DESC');
+    return r.rows;
+  },
+  async saveOrder(order, apiKey) {
+    if (!process.env.DATABASE_URL) { _orders.push(order); return; }
+    await pool.query(`
+      INSERT INTO orders (id,agent_id,api_key,market_id,outcome_id,market_title,outcome_label,side,amount,price,shares,potential_payout,status,created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+    `, [order.id,order.agent_id,apiKey,order.market_id,order.outcome_id,order.market_title,
+        order.outcome_label,order.side,order.amount,order.price,order.shares,
+        order.potential_payout,order.status,order.created_at]);
+  },
+  async getOrders(agentId) {
+    if (!process.env.DATABASE_URL) return _orders.filter(o => o.agent_id === agentId);
+    const r = await pool.query('SELECT * FROM orders WHERE agent_id=$1 ORDER BY created_at DESC', [agentId]);
+    return r.rows;
+  },
+  async deleteOrder(orderId, agentId) {
+    if (!process.env.DATABASE_URL) {
+      const idx = _orders.findIndex(o => o.id === orderId && o.agent_id === agentId);
+      if (idx === -1) return false;
+      _orders.splice(idx, 1); return true;
     }
-  } catch(e) { console.warn('Could not load data:', e.message); }
-}
-
-function saveData() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ agents: Object.fromEntries(agents), orders, saved_at: new Date().toISOString() }), 'utf8');
-  } catch(e) { console.warn('Could not save data:', e.message); }
-}
+    const r = await pool.query('DELETE FROM orders WHERE id=$1 AND agent_id=$2', [orderId, agentId]);
+    return r.rowCount > 0;
+  },
+};
 
 // ── HELPER ───────────────────────────────────────────────────────────────────
 function authHeader(req) {
@@ -50,13 +120,18 @@ function getAgentKey(req) {
   return h.startsWith('Bearer ') ? h.slice(7) : null;
 }
 
-function requireAgent(req, res, next) {
+async function requireAgent(req, res, next) {
   const key = getAgentKey(req);
-  if (!key || !agents.has(key)) {
-    return res.status(401).json({ error: 'Invalid or missing API key' });
+  if (!key) return res.status(401).json({ error: 'Invalid or missing API key' });
+  try {
+    const agent = await db.getAgent(key);
+    if (!agent) return res.status(401).json({ error: 'Invalid or missing API key' });
+    req.agent = agent;
+    req.apiKey = key;
+    next();
+  } catch(e) {
+    res.status(500).json({ error: 'DB error', detail: e.message });
   }
-  req.agent = agents.get(key);
-  next();
 }
 
 // ── CACHE CLEAR ──────────────────────────────────────────────────────────────
@@ -188,7 +263,8 @@ app.post('/v1/agents/register', async (req, res) => {
     bankr_wallet: null,   // akan diisi kalau Bankr wallet provisioning aktif
   };
 
-  agents.set(apiKey, agent);
+  agent.api_key = apiKey;
+  await db.saveAgent(agent);
 
   // ── Opsional: Provisioning Bankr wallet ─────────────────────────────────
   if (BANKR_KEY) {
@@ -204,6 +280,7 @@ app.post('/v1/agents/register', async (req, res) => {
       if (br.ok) {
         const bdata = await br.json();
         agent.bankr_wallet = bdata.wallet || bdata.address || null;
+        await db.saveAgent(agent);
       }
     } catch (_) { /* wallet provisioning optional */ }
   }
@@ -224,9 +301,10 @@ app.get('/v1/agents/me', requireAgent, (req, res) => {
 });
 
 // ── AGENT WEBHOOK ─────────────────────────────────────────────────────────────
-app.post('/v1/agents/webhook', requireAgent, (req, res) => {
+app.post('/v1/agents/webhook', requireAgent, async (req, res) => {
   const { webhook_url } = req.body;
   req.agent.webhook_url = webhook_url;
+  await db.saveAgent(req.agent);
   res.json({ message: 'Webhook updated', webhook_url });
 });
 
@@ -257,41 +335,41 @@ app.post('/v1/orders', requireAgent, (req, res) => {
 
   req.agent.balance = parseFloat((req.agent.balance - amount).toFixed(2));
   req.agent.trades++;
-  orders.push(order);
-  saveData();
+  await db.saveOrder(order, req.apiKey);
+  await db.saveAgent(req.agent);
 
   res.status(201).json({ ...order, shares_received: order.shares });
 });
 
-app.get('/v1/orders', requireAgent, (req, res) => {
-  const myOrders = orders.filter(o => o.agent_id === req.agent.id);
+app.get('/v1/orders', requireAgent, async (req, res) => {
+  const myOrders = await db.getOrders(req.agent.id);
   res.json({ orders: myOrders, count: myOrders.length });
 });
 
-app.delete('/v1/orders/:id', requireAgent, (req, res) => {
-  const idx = orders.findIndex(o => o.id === req.params.id && o.agent_id === req.agent.id);
-  if (idx === -1) return res.status(404).json({ error: 'Order not found' });
-  orders.splice(idx, 1);
+app.delete('/v1/orders/:id', requireAgent, async (req, res) => {
+  const deleted = await db.deleteOrder(req.params.id, req.agent.id);
+  if (!deleted) return res.status(404).json({ error: 'Order not found' });
   res.json({ message: 'Order cancelled' });
 });
 
 // ── PORTFOLIO ────────────────────────────────────────────────────────────────
-app.get('/v1/portfolio', requireAgent, (req, res) => {
-  const myOrders = orders.filter(o => o.agent_id === req.agent.id && o.status === 'filled');
-  const totalSpent = myOrders.reduce((s, o) => s + o.amount, 0);
+app.get('/v1/portfolio', requireAgent, async (req, res) => {
+  const myOrders = await db.getOrders(req.agent.id);
+  const totalSpent = myOrders.filter(o => o.status === 'filled').reduce((s, o) => s + parseFloat(o.amount), 0);
   res.json({
-    balance_usdc: parseFloat(req.agent.balance.toFixed(2)),
-    total_pnl: parseFloat((req.agent.pnl || 0).toFixed(2)),
-    total_trades: req.agent.trades || 0,
-    win_rate: req.agent.win_rate || 0,
+    balance_usdc: parseFloat(req.agent.balance),
+    total_pnl: parseFloat(req.agent.pnl || 0),
+    total_trades: parseInt(req.agent.trades) || 0,
+    win_rate: parseFloat(req.agent.win_rate || 0),
     bankr_wallet: req.agent.bankr_wallet,
     total_invested: parseFloat(totalSpent.toFixed(2)),
   });
 });
 
-app.get('/v1/portfolio/positions', requireAgent, (req, res) => {
-  const positions = orders
-    .filter(o => o.agent_id === req.agent.id && o.status === 'filled')
+app.get('/v1/portfolio/positions', requireAgent, async (req, res) => {
+  const allOrders = await db.getOrders(req.agent.id);
+  const positions = allOrders
+    .filter(o => o.status === 'filled')
     .map(o => ({
       order_id: o.id,
       market_id: o.market_id,
@@ -308,11 +386,11 @@ app.get('/v1/portfolio/positions', requireAgent, (req, res) => {
   res.json({ positions, count: positions.length });
 });
 
-app.get('/v1/portfolio/history', requireAgent, (req, res) => {
+app.get('/v1/portfolio/history', requireAgent, async (req, res) => {
   const limit = parseInt(req.query.limit) || 10;
-  const trades = orders
-    .filter(o => o.agent_id === req.agent.id)
-    .slice(-limit)
+  const allOrders = await db.getOrders(req.agent.id);
+  const trades = allOrders
+    .slice(0, limit)
     .reverse()
     .map(o => ({
       id: o.id,
@@ -329,9 +407,9 @@ app.get('/v1/portfolio/history', requireAgent, (req, res) => {
 });
 
 // ── LEADERBOARD ──────────────────────────────────────────────────────────────
-app.get('/v1/leaderboard', (req, res) => {
-  const board = [...agents.values()]
-    .sort((a, b) => b.balance - a.balance)
+app.get('/v1/leaderboard', async (req, res) => {
+  const allAgents = await db.getAllAgents();
+  const board = allAgents
     .slice(0, 20)
     .map((a, i) => ({
       rank: i + 1,
@@ -493,7 +571,7 @@ app.post('/v1/ai/agent', requireAgent, async (req, res) => {
 });
 
 // ── START ─────────────────────────────────────────────────────────────────────
-loadData();
+initDB().catch(console.error);
 app.listen(PORT, () => {
   console.log(`🚀 PoneMarket backend running on port ${PORT}`);
   console.log(`🤖 Bankr: ${BANKR_KEY ? '✅ connected' : '❌ not configured'}`);
